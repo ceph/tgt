@@ -61,7 +61,8 @@ check() {
 }
 
 build_rpm() {
-    name=scsi-target-utils-$version-$release
+    release="${release}.ceph%{?dist}"
+    name=scsi-target-utils-$version
     TARBALL=$name.tgz
     SRPM=$_TOP/SRPMS/$name.src.rpm
 
@@ -103,6 +104,11 @@ build_deb() {
     mkdir -p $_TOP/$name/debian
     cp -a scripts/deb/* $_TOP/$name/debian
     cd $_TOP/$name
+    if [[ $BPTAG == ~* ]] ; then
+        release="${release}${BPTAG}.ceph"
+    else
+        release="${release}.${BPTAG}.ceph"
+    fi
     sed -i -r "s/^tgt \(([0-9.-]+)\) (.*)/tgt \($version-$release\) \2/" debian/changelog
     debuild -uc -us
     check "Failed building deb package."

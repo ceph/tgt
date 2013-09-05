@@ -6,7 +6,7 @@ Packager:       Roi Dayan <roid@mellanox.com>
 Group:          System Environment/Daemons
 License:        GPLv2
 URL:            http://stgt.sourceforge.net/
-Source0:        %{name}-%{version}-%{release}.tgz
+Source0:        %{name}-%{version}.tgz
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildRequires:  pkgconfig libibverbs-devel librdmacm-devel libxslt docbook-style-xsl libaio-devel
 %if %{defined suse_version}
@@ -25,7 +25,7 @@ Currently, software iSCSI targets are supported.
 
 
 %prep
-%setup -q -n %{name}-%{version}-%{release}
+%setup -q -n %{name}-%{version}
 
 
 %build
