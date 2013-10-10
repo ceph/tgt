@@ -109,7 +109,7 @@ build_deb() {
     else
         release="${release}.${BPTAG}.ceph"
     fi
-    sed -i -r "s/^tgt \(([0-9.-]+)\) (.*)/tgt \($version-$release\) \2/" debian/changelog
+    sed -i -r "s/^tgt \(([0-9.-]+)\) (.*)/tgt \(1:$version-$release\) \2/" debian/changelog
     debuild -uc -us
     check "Failed building deb package."
     cd ../..
