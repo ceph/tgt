@@ -380,7 +380,7 @@ static void bs_aio_close(struct scsi_lu *lu)
 	close(lu->fd);
 }
 
-static tgtadm_err bs_aio_init(struct scsi_lu *lu)
+static tgtadm_err bs_aio_init(struct scsi_lu *lu, char *bsopts)
 {
 	struct bs_aio_info *info = BS_AIO_I(lu);
 	int i;
@@ -414,7 +414,7 @@ static struct backingstore_template aio_bst = {
 	.bs_cmd_submit  	= bs_aio_cmd_submit,
 };
 
-__attribute__((constructor)) static void bs_rdwr_constructor(void)
+void register_bs_module(void)
 {
 	register_backingstore_template(&aio_bst);
 }

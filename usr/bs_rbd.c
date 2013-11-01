@@ -45,21 +45,22 @@
 #include "rados/librados.h"
 #include "rbd/librbd.h"
 
-/* one cluster connection only */
-rados_t cluster;
 
 struct active_rbd {
 	char *poolname;
 	char *imagename;
 	char *snapname;
+	rados_t cluster;
 	rados_ioctx_t ioctx;
 	rbd_image_t rbd_image;
 };
 
-#define MAX_IMAGES	20
-struct active_rbd active_rbds[MAX_IMAGES];
-
-#define RBDP(fd)	(&active_rbds[fd])
+/* active_rbd is allocated just after the bs_thread_info */
+#define RBDP(lu)	((struct active_rbd *) \
+				((char *)lu + \
+				sizeof(struct scsi_lu) + \
+				sizeof(struct bs_thread_info)) \
+			)
 
 static void parse_imagepath(char *path, char **pool, char **image, char **snap)
 {
@@ -100,7 +101,7 @@ static void bs_sync_sync_range(struct scsi_cmd *cmd, uint32_t length,
 {
 	int ret;
 
-	ret = rbd_flush(RBDP(cmd->dev->fd)->rbd_image);
+	ret = rbd_flush(RBDP(cmd->dev)->rbd_image);
 	if (ret)
 		set_medium_error(result, key, asc);
 }
@@ -130,7 +131,7 @@ static void bs_rbd_request(struct scsi_cmd *cmd)
 	const char *write_buf = NULL;
 	ret = length = 0;
 	key = asc = 0;
-	struct active_rbd *rbd = RBDP(cmd->dev->fd);
+	struct active_rbd *rbd = RBDP(cmd->dev);
 
 	switch (cmd->scb[0]) {
 	case ORWRITE_16:
@@ -420,21 +421,9 @@ static int bs_rbd_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *size)
 	char *poolname;
 	char *imagename;
 	char *snapname;
-	struct active_rbd *rbd = NULL;
-	int lfd;
+	struct active_rbd *rbd = RBDP(lu);
 
 	parse_imagepath(path, &poolname, &imagename, &snapname);
-	for (lfd = 0; lfd < MAX_IMAGES; lfd++) {
-		if (active_rbds[lfd].rbd_image == NULL) {
-			rbd = &active_rbds[lfd];
-			*fd = lfd;
-			break;
-		}
-	}
-	if (!rbd) {
-		*fd = -1;
-		return -EMFILE;
-	}
 
 	rbd->poolname = poolname;
 	rbd->imagename = imagename;
@@ -442,11 +431,12 @@ static int bs_rbd_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *size)
 	eprintf("bs_rbd_open: pool: %s image: %s snap: %s\n",
 		poolname, imagename, snapname);
 
-	if ((ret == rados_ioctx_create(cluster, poolname, &rbd->ioctx)) < 0) {
+	if ((ret == rados_ioctx_create(rbd->cluster, poolname, &rbd->ioctx))
+	    < 0) {
 		eprintf("bs_rbd_open: rados_ioctx_create: %d\n", ret);
 		return -EIO;
 	}
-	/* null snap name */
+
 	ret = rbd_open(rbd->ioctx, imagename, &rbd->rbd_image, snapname);
 	if (ret < 0) {
 		eprintf("bs_rbd_open: rbd_open: %d\n", ret);
@@ -467,7 +457,7 @@ static int bs_rbd_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *size)
 
 static void bs_rbd_close(struct scsi_lu *lu)
 {
-	struct active_rbd *rbd = RBDP(lu->fd);
+	struct active_rbd *rbd = RBDP(lu);
 
 	if (rbd->rbd_image) {
 		rbd_close(rbd->rbd_image);
@@ -476,51 +466,129 @@ static void bs_rbd_close(struct scsi_lu *lu)
 	}
 }
 
-static tgtadm_err bs_rbd_init(struct scsi_lu *lu)
+// Slurp up and return a copy of everything to the next ';', and update p
+static char *slurp_to_semi(char **p)
 {
+	char *end = index(*p, ';');
+	char *ret;
+	int len;
+
+	if (end == NULL)
+		end = *p + strlen(*p);
+	len = end - *p;
+	ret = malloc(len + 1);
+	strncpy(ret, *p, len);
+	ret[len] = '\0';
+	*p = end;
+	return ret;
+}
+
+static char *slurp_value(char **p)
+{
+	char *equal = index(*p, '=');
+	if (equal) {
+		*p = equal + 1;
+		return slurp_to_semi(p);
+	} else {
+		// uh...no?
+		return NULL;
+	}
+}
+
+static int is_opt(const char *opt, char *p)
+{
+	int ret = 0;
+	if ((strncmp(p, opt, strlen(opt)) == 0) &&
+	    (p[strlen(opt)] == '=')) {
+		ret = 1;
+	}
+	return ret;
+}
+
+
+static tgtadm_err bs_rbd_init(struct scsi_lu *lu, char *bsopts)
+{
+	struct bs_thread_info *info = BS_THREAD_I(lu);
 	tgtadm_err ret = TGTADM_UNKNOWN_ERR;
 	int rados_ret;
-	struct bs_thread_info *info = BS_THREAD_I(lu);
+	struct active_rbd *rbd = RBDP(lu);
+	char *confname = NULL;
+	char *clientid = NULL;
+	char *ignore = NULL;
 
-	rados_ret = rados_create(&cluster, NULL);
+	dprintf("bs_rbd_init bsopts: \"%s\"\n", bsopts);
+
+	// look for conf= or id=
+
+	while (bsopts && strlen(bsopts)) {
+		if (is_opt("conf", bsopts))
+			confname = slurp_value(&bsopts);
+		else if (is_opt("id", bsopts))
+			clientid = slurp_value(&bsopts);
+		else {
+			ignore = slurp_to_semi(&bsopts);
+			eprintf("bs_rbd: ignoring unknown option \"%s\"\n",
+				ignore);
+			free(ignore);
+			break;
+		}
+	}
+
+	if (clientid)
+		eprintf("bs_rbd_init: clientid %s\n", clientid);
+	if (confname)
+		eprintf("bs_rbd_init: confname %s\n", confname);
+
+	eprintf("bs_rbd_init bsopts=%s\n", bsopts);
+	/* clientid may be set by -i/--id */
+	rados_ret = rados_create(&rbd->cluster, clientid);
 	if (rados_ret < 0) {
 		eprintf("bs_rbd_init: rados_create: %d\n", rados_ret);
 		return ret;
 	}
-	/* read config from environment and then default files */
-	rados_ret = rados_conf_parse_env(cluster, NULL);
+	/*
+	 * Read config from environment, then conf file(s) which may
+	 * be set by conf=
+	 */
+	rados_ret = rados_conf_parse_env(rbd->cluster, NULL);
 	if (rados_ret < 0) {
 		eprintf("bs_rbd_init: rados_conf_parse_env: %d\n", rados_ret);
 		goto fail;
 	}
-	rados_ret = rados_conf_read_file(cluster, NULL);
+	rados_ret = rados_conf_read_file(rbd->cluster, confname);
 	if (rados_ret < 0) {
 		eprintf("bs_rbd_init: rados_conf_read_file: %d\n", rados_ret);
 		goto fail;
 	}
-	rados_ret = rados_connect(cluster);
+	rados_ret = rados_connect(rbd->cluster);
 	if (rados_ret < 0) {
 		eprintf("bs_rbd_init: rados_connect: %d\n", rados_ret);
 		goto fail;
 	}
 	ret = bs_thread_open(info, bs_rbd_request, nr_iothreads);
-	if (ret == TGTADM_SUCCESS)
-		return ret;
 fail:
+	if (confname)
+		free(confname);
+	if (clientid)
+		free(clientid);
+
 	return ret;
 }
 
 static void bs_rbd_exit(struct scsi_lu *lu)
 {
 	struct bs_thread_info *info = BS_THREAD_I(lu);
+	struct active_rbd *rbd = RBDP(lu);
 
+	/* do this first to try to be sure there's no outstanding I/O */
 	bs_thread_close(info);
-	rados_shutdown(&cluster);
+	rados_shutdown(rbd->cluster);
 }
 
 static struct backingstore_template rbd_bst = {
 	.bs_name		= "rbd",
-	.bs_datasize		= sizeof(struct bs_thread_info),
+	.bs_datasize		= sizeof(struct bs_thread_info) +
+				  sizeof(struct active_rbd),
 	.bs_open		= bs_rbd_open,
 	.bs_close		= bs_rbd_close,
 	.bs_init		= bs_rbd_init,
@@ -529,7 +597,7 @@ static struct backingstore_template rbd_bst = {
 	.bs_oflags_supported    = O_SYNC | O_DIRECT,
 };
 
-static __attribute__((constructor)) void bs_rbd_constructor(void)
+void register_bs_module(void)
 {
 	register_backingstore_template(&rbd_bst);
 }
