@@ -87,4 +87,5 @@ fi
 %{_mandir}/man8/*
 %{_initrddir}/tgtd
 /etc/bash_completion.d/tgt
+/usr/lib/tgt/backing-store/bs_rbd.so
 %attr(0600,root,root) %config(noreplace) /etc/tgt/targets.conf
